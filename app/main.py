@@ -185,6 +185,19 @@ def get_scripts(request: Request) -> SimpleNamespace:
     return request.app.state.scripts
 
 
+def as_int(value) -> int | None:
+    """把 Lua 以精确十进制字符串返回的防栅序号 / 时间戳在 HTTP 边界转成 int。
+
+    防栅序号在 Lua 内全程按字符串处理（超过 2^53 也不丢位，见 app/lua.py
+    的精度约定），redis-py 原样传回 str；这里统一转 int，使 HTTP 响应继续
+    输出 JSON 数字字段。Lua 的 false / nil 会解码为 None / False，表示无
+    关联序号，返回 None。
+    """
+    if value is None or value is False:
+        return None
+    return int(value)
+
+
 RedisDep = Annotated[Redis, Depends(get_redis)]
 ScriptsDep = Annotated[SimpleNamespace, Depends(get_scripts)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
@@ -313,14 +326,14 @@ async def acquire(
             acquired=True,
             task_key=req.task_key,
             token=token,
-            fencing_token=fencing,
+            fencing_token=as_int(fencing),
             expires_at_ms=expires_at,
         )
     response.status_code = status.HTTP_409_CONFLICT
     return AcquireResponse(
         acquired=False,
         task_key=req.task_key,
-        fencing_token=fencing,
+        fencing_token=as_int(fencing),
         expires_at_ms=expires_at,
     )
 
@@ -364,7 +377,7 @@ async def acquire_batch(
             AcquiredLease(
                 task_key=req.task_keys[i],
                 token=tokens[i],
-                fencing_token=result[1 + 2 * i],
+                fencing_token=as_int(result[1 + 2 * i]),
                 expires_at_ms=result[2 + 2 * i],
             )
             for i in range(len(req.task_keys))
@@ -505,14 +518,14 @@ async def transfer(
             transferred=True,
             task_key=req.task_key,
             token=new_token,
-            fencing_token=fencing,
+            fencing_token=as_int(fencing),
             expires_at_ms=expires_at,
         )
     response.status_code = status.HTTP_409_CONFLICT
     return TransferResponse(
         transferred=False,
         task_key=req.task_key,
-        fencing_token=fencing or None,
+        fencing_token=as_int(fencing),
         expires_at_ms=expires_at or None,
         reason=_reason,
     )
@@ -709,9 +722,9 @@ def build_commit_response(
         return ResultCommitResponse(
             committed=False,
             task_key=req.task_key,
-            fencing_token=int(fencing),
+            fencing_token=as_int(fencing),
             result=None,
-            committed_at_ms=int(committed_at) if committed_at else None,
+            committed_at_ms=as_int(committed_at),
             reason=reason,
         )
 
@@ -721,9 +734,9 @@ def build_commit_response(
         committed=True,
         replayed=kind == 2,
         task_key=req.task_key,
-        fencing_token=int(fencing),
+        fencing_token=as_int(fencing),
         result=req.result,
-        committed_at_ms=int(committed_at),
+        committed_at_ms=as_int(committed_at),
     )
     if kind == 2:
         response.headers["Result-Replay"] = "true"
@@ -877,7 +890,7 @@ async def list_result_changes(
         ResultChange(
             id=result[2 + 5 * i],
             task_key=result[3 + 5 * i],
-            fencing_token=int(result[4 + 5 * i]),
+            fencing_token=as_int(result[4 + 5 * i]),
             committed_at_ms=int(result[5 + 5 * i]),
             result=json.loads(result[6 + 5 * i]),
         )
@@ -1050,10 +1063,11 @@ async def dependencies_snapshot(
             task_key=task_key, status="pending", dependencies=[], pending=pending
         )
 
-    # {1, n, dep_1, fencing_1, dep_2, fencing_2, ...}（n 位于下标 1）
+    # {1, n, dep_1, fencing_1, dep_2, fencing_2, ...}（n 位于下标 1）；
+    # fencing 为精确十进制字符串（2^53 以上不丢位），在 HTTP 边界转 int
     items = [
         DependencySnapshotItem(task_key=result[2 + 2 * i],
-                               fencing_token=result[3 + 2 * i])
+                               fencing_token=as_int(result[3 + 2 * i]))
         for i in range(result[1])
     ]
     return DependencySnapshotResponse(
