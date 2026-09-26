@@ -313,14 +313,14 @@ async def acquire(
             acquired=True,
             task_key=req.task_key,
             token=token,
-            fencing_token=fencing,
+            fencing_token=int(fencing),
             expires_at_ms=expires_at,
         )
     response.status_code = status.HTTP_409_CONFLICT
     return AcquireResponse(
         acquired=False,
         task_key=req.task_key,
-        fencing_token=fencing,
+        fencing_token=int(fencing) if fencing not in (None, "") else None,
         expires_at_ms=expires_at,
     )
 
@@ -364,7 +364,8 @@ async def acquire_batch(
             AcquiredLease(
                 task_key=req.task_keys[i],
                 token=tokens[i],
-                fencing_token=result[1 + 2 * i],
+                # Lua 返回精确十进制串（2^53 以上安全），转 Python 任意精度 int
+                fencing_token=int(result[1 + 2 * i]),
                 expires_at_ms=result[2 + 2 * i],
             )
             for i in range(len(req.task_keys))
@@ -505,14 +506,15 @@ async def transfer(
             transferred=True,
             task_key=req.task_key,
             token=new_token,
-            fencing_token=fencing,
+            # Lua 返回精确十进制串（2^53 以上安全），转 Python 任意精度 int
+            fencing_token=int(fencing),
             expires_at_ms=expires_at,
         )
     response.status_code = status.HTTP_409_CONFLICT
     return TransferResponse(
         transferred=False,
         task_key=req.task_key,
-        fencing_token=fencing or None,
+        fencing_token=int(fencing) if fencing not in (None, "") else None,
         expires_at_ms=expires_at or None,
         reason=_reason,
     )
@@ -704,12 +706,15 @@ def build_commit_response(
     committed_at,
 ) -> ResultCommitResponse:
     """把结果提交 Lua（普通 / 受保护共享同一返回契约）的结果转为 HTTP 响应。"""
+    # Lua 返回的防栅序号是精确十进制串（2^53 以上也不丢精度），
+    # 转 Python 任意精度 int；committed_at_ms 为毫秒时间戳，int() 兼容字符串
+    fencing_val = int(fencing) if fencing not in (None, "") else None
     if kind == 0:
         response.status_code = status.HTTP_409_CONFLICT
         return ResultCommitResponse(
             committed=False,
             task_key=req.task_key,
-            fencing_token=int(fencing),
+            fencing_token=fencing_val,
             result=None,
             committed_at_ms=int(committed_at) if committed_at else None,
             reason=reason,
@@ -721,7 +726,7 @@ def build_commit_response(
         committed=True,
         replayed=kind == 2,
         task_key=req.task_key,
-        fencing_token=int(fencing),
+        fencing_token=fencing_val,
         result=req.result,
         committed_at_ms=int(committed_at),
     )
@@ -1051,9 +1056,10 @@ async def dependencies_snapshot(
         )
 
     # {1, n, dep_1, fencing_1, dep_2, fencing_2, ...}（n 位于下标 1）
+    # Lua 返回的 fencing 为精确十进制串，转 Python 任意精度 int
     items = [
         DependencySnapshotItem(task_key=result[2 + 2 * i],
-                               fencing_token=result[3 + 2 * i])
+                               fencing_token=int(result[3 + 2 * i]))
         for i in range(result[1])
     ]
     return DependencySnapshotResponse(

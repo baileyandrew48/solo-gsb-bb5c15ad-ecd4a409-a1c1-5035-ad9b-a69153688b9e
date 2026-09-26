@@ -9,6 +9,22 @@
 - 过期判断一律使用 redis.call('TIME')，即 Redis 服务器时间，
   避免各客户端时钟不一致导致的问题。
 
+防栅序号精度约定（2^53 以上必须精确）：
+- Redis Lua 的 number 是双精度浮点：任何整数回复（INCR / HGET 后再
+  tonumber 等）在进入 Lua 时都可能被舍入，序号达到 2^53 后相邻两个序号
+  （如 9007199254740993 与 9007199254740994）会被 tonumber 成同一个值，
+  连 tostring() 也只会输出舍入后的科学计数法，无法还原。
+- 因此防栅序号在 Lua 内一律以**精确十进制字符串**传递，绝不经过
+  tonumber：
+    * 递增后不取 INCR 的数值回复，而是在同一 Lua 原子执行内再 GET 一次
+      计数器，拿到服务端 int64 转成的精确十进制串（INCR 本身按服务端
+      int64 运算，精度不受 Lua 影响）；
+    * 该字符串直接用于 HSET 落 Hash、XADD 审计字段、脚本返回值；
+    * 凭据校验（token + fencing）、结果提交版本判定（同序号重放 /
+      不同序号覆盖）、前置快照版本核对全部做字符串相等比较；
+    * Python 侧把返回的十进制串 int() 成任意精度整数再放进 HTTP 数字字段。
+  expires_at / committed_at_ms 等毫秒时间戳量级远低于 2^53，仍按 number 处理。
+
 租约审计约定：
 - 每个任务键对应一个 Redis Stream（事件流键），申请（成功 / 被拒）、
   续租（单个 / 批量）、交接（成功 / 失败）、释放以及批量申请的逐任务结果
@@ -142,14 +158,18 @@ local retention = ARGV[3]
 
 local expires_at = redis.call('HGET', KEYS[1], 'expires_at')
 if expires_at and tonumber(expires_at) > now then
-  local fencing = tonumber(redis.call('HGET', KEYS[1], 'fencing'))
+  -- 防栅序号按精确十进制字符串处理（2^53 以上也不经过 tonumber）
+  local fencing = redis.call('HGET', KEYS[1], 'fencing')
   audit_add(KEYS[3], retention,
     {'op', 'acquire', 'result', 'conflict',
-     'fencing', tostring(fencing), 'time_ms', tostring(now)})
-  return {0, fencing, tonumber(expires_at)}
+     'fencing', fencing or '', 'time_ms', tostring(now)})
+  return {0, fencing or '', tonumber(expires_at)}
 end
 
-local fencing = redis.call('INCR', KEYS[2])
+-- INCR 按服务端 int64 精确递增；其 Lua 数值回复在 2^53 以上会被舍入，
+-- 故同一次原子执行内再 GET 取回精确十进制串，后续存储 / 返回一律用它
+redis.call('INCR', KEYS[2])
+local fencing = redis.call('GET', KEYS[2])
 redis.call('HSET', KEYS[1],
   'token', ARGV[1],
   'fencing', fencing,
@@ -157,7 +177,7 @@ redis.call('HSET', KEYS[1],
 redis.call('PEXPIRE', KEYS[1], ttl)
 audit_add(KEYS[3], retention,
   {'op', 'acquire', 'result', 'acquired',
-   'fencing', tostring(fencing), 'time_ms', tostring(now)})
+   'fencing', fencing, 'time_ms', tostring(now)})
 return {1, fencing, now + ttl}
 """
 
@@ -194,10 +214,11 @@ for i = 1, n do
 end
 if #conflicts > 0 then
   for _, i in ipairs(conflicts) do
-    local fencing = tonumber(redis.call('HGET', KEYS[i], 'fencing'))
+    -- 防栅序号按精确十进制字符串读取（不经过 tonumber）
+    local fencing = redis.call('HGET', KEYS[i], 'fencing')
     audit_add(KEYS[2 * n + i], retention,
       {'op', 'acquire_batch', 'result', 'conflict',
-       'fencing', tostring(fencing), 'time_ms', tostring(now),
+       'fencing', fencing or '', 'time_ms', tostring(now),
        'batch_size', tostring(n)})
   end
   local reply = {0}
@@ -210,7 +231,9 @@ end
 local expires = now + ttl
 local reply = {1}
 for i = 1, n do
-  local fencing = redis.call('INCR', KEYS[n + i])
+  -- INCR 按服务端 int64 精确递增；再 GET 取回精确十进制串（2^53 以上安全）
+  redis.call('INCR', KEYS[n + i])
+  local fencing = redis.call('GET', KEYS[n + i])
   redis.call('HSET', KEYS[i],
     'token', ARGV[i + 1],
     'fencing', fencing,
@@ -218,7 +241,7 @@ for i = 1, n do
   redis.call('PEXPIRE', KEYS[i], ttl)
   audit_add(KEYS[2 * n + i], retention,
     {'op', 'acquire_batch', 'result', 'acquired',
-     'fencing', tostring(fencing), 'time_ms', tostring(now),
+     'fencing', fencing, 'time_ms', tostring(now),
      'batch_size', tostring(n)})
   reply[#reply + 1] = fencing
   reply[#reply + 1] = expires
@@ -247,10 +270,9 @@ if not token then
 end
 local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
 if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
-  local f = tonumber(current_fencing)
   audit_add(KEYS[2], retention,
     {'op', 'renew', 'result', 'conflict',
-     'fencing', f and tostring(f) or '', 'time_ms', tostring(now)})
+     'fencing', current_fencing or '', 'time_ms', tostring(now)})
   return {0, 'conflict', 0}
 end
 
@@ -315,10 +337,10 @@ end
 
 if #failures > 0 then
   for _, i in ipairs(failures) do
-    local f = tonumber(redis.call('HGET', KEYS[i], 'fencing'))
+    local f = redis.call('HGET', KEYS[i], 'fencing')
     audit_add(KEYS[n + i], retention,
       {'op', 'renew_batch', 'result', reasons[i],
-       'fencing', f and tostring(f) or '', 'time_ms', tostring(now),
+       'fencing', f or '', 'time_ms', tostring(now),
        'batch_size', tostring(n)})
   end
   local reply = {0}
@@ -366,14 +388,14 @@ if not token then
   audit_add(KEYS[3], retention,
     {'op', 'transfer', 'result', 'not_found',
      'fencing', '', 'time_ms', tostring(now)})
-  return {0, 'not_found', 0, 0}
+  return {0, 'not_found', '', 0}
 end
 local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
 if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
   audit_add(KEYS[3], retention,
     {'op', 'transfer', 'result', 'conflict',
-     'fencing', current_fencing, 'time_ms', tostring(now)})
-  return {0, 'conflict', tonumber(current_fencing),
+     'fencing', current_fencing or '', 'time_ms', tostring(now)})
+  return {0, 'conflict', current_fencing or '',
     tonumber(redis.call('HGET', KEYS[1], 'expires_at'))}
 end
 
@@ -381,16 +403,18 @@ local expires_at = tonumber(redis.call('HGET', KEYS[1], 'expires_at'))
 if expires_at <= now then
   audit_add(KEYS[3], retention,
     {'op', 'transfer', 'result', 'expired',
-     'fencing', current_fencing, 'time_ms', tostring(now)})
-  return {0, 'expired', tonumber(current_fencing), expires_at}
+     'fencing', current_fencing or '', 'time_ms', tostring(now)})
+  return {0, 'expired', current_fencing or '', expires_at}
 end
 
--- 保留原 expires_at，仅替换 token 并递增防栅序号；不重新 PEXPIRE，交接不续期
-local new_fencing = redis.call('INCR', KEYS[2])
+-- 保留原 expires_at，仅替换 token 并递增防栅序号；不重新 PEXPIRE，交接不续期。
+-- INCR 按服务端 int64 精确递增；再 GET 取回精确十进制串（2^53 以上安全）。
+redis.call('INCR', KEYS[2])
+local new_fencing = redis.call('GET', KEYS[2])
 redis.call('HSET', KEYS[1], 'token', ARGV[3], 'fencing', new_fencing)
 audit_add(KEYS[3], retention,
   {'op', 'transfer', 'result', 'transferred',
-   'fencing', tostring(new_fencing), 'time_ms', tostring(now)})
+   'fencing', new_fencing, 'time_ms', tostring(now)})
 return {1, 'ok', new_fencing, expires_at}
 """
 
@@ -413,10 +437,9 @@ if not token then
 end
 local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
 if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
-  local f = tonumber(current_fencing)
   audit_add(KEYS[2], retention,
     {'op', 'release', 'result', 'ignored',
-     'fencing', f and tostring(f) or '', 'time_ms', tostring(now)})
+     'fencing', current_fencing or '', 'time_ms', tostring(now)})
   return 0
 end
 redis.call('DEL', KEYS[1])
@@ -501,40 +524,43 @@ local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
 if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
   audit_add(KEYS[3], retention,
     {'op', 'result_commit', 'result', 'conflict',
-     'fencing', current_fencing, 'time_ms', tostring(now)})
-  return {0, 'conflict', tonumber(current_fencing), 0}
+     'fencing', current_fencing or '', 'time_ms', tostring(now)})
+  return {0, 'conflict', current_fencing or '', 0}
 end
 
 local expires_at = tonumber(redis.call('HGET', KEYS[1], 'expires_at'))
 if expires_at <= now then
   audit_add(KEYS[3], retention,
     {'op', 'result_commit', 'result', 'expired',
-     'fencing', current_fencing, 'time_ms', tostring(now)})
-  return {0, 'expired', tonumber(current_fencing), 0}
+     'fencing', current_fencing or '', 'time_ms', tostring(now)})
+  return {0, 'expired', current_fencing or '', 0}
 end
 """
 
 # 租约校验通过后的幂等 / 防栅写入尾部（head 与本段共享 current_fencing 等局部变量）
 _RESULT_COMMIT_TAIL_LUA = """
--- 凭据有效且租约未过期：同一脚本内判定幂等 / 冲突并写入结果
+-- 凭据有效且租约未过期：同一脚本内判定幂等 / 冲突并写入结果。
+-- 防栅序号一律按精确十进制字符串比较：2^53 以上相邻序号经 tonumber 会
+-- 舍入成同一个 double，旧凭据可能被当作同版重放，故这里绝不转 number。
 local stored = redis.call('HMGET', KEYS[2], 'fencing', 'committed_at_ms')
 if stored[1] then
-  if tonumber(stored[1]) == tonumber(ARGV[2]) then
+  if stored[1] == ARGV[2] then
     if redis.call('HGET', KEYS[2], 'result') == ARGV[3] then
       audit_add(KEYS[3], retention,
         {'op', 'result_commit', 'result', 'replayed',
          'fencing', ARGV[2], 'time_ms', tostring(now)})
-      return {2, 'replayed', tonumber(ARGV[2]), tonumber(stored[2])}
+      return {2, 'replayed', ARGV[2], stored[2]}
     end
     audit_add(KEYS[3], retention,
       {'op', 'result_commit', 'result', 'result_conflict',
        'fencing', ARGV[2], 'time_ms', tostring(now)})
-    return {0, 'result_conflict', tonumber(stored[1]), tonumber(stored[2])}
+    return {0, 'result_conflict', stored[1], stored[2]}
   end
 end
 
 -- 首次提交（该序号）或更新租约（fencing 更大）提交新结果：覆盖写入。
 -- 结果键不设置 TTL：结果持久保留，不随租约到期而删除。
+-- ARGV[2] 是精确十进制串，HSET / XADD / 返回值全部原样使用，不经过 number
 redis.call('HSET', KEYS[2],
   'result', ARGV[3],
   'fencing', ARGV[2],
@@ -550,7 +576,7 @@ audit_add(KEYS[4], change_retention,
    'fencing', ARGV[2],
    'committed_at_ms', tostring(now),
    'result', ARGV[3]})
-return {1, 'committed', tonumber(ARGV[2]), now}
+return {1, 'committed', ARGV[2], now}
 """
 
 RESULT_COMMIT_LUA = _RESULT_COMMIT_HEAD_LUA + _RESULT_COMMIT_TAIL_LUA
@@ -579,6 +605,8 @@ RESULT_COMMIT_CHECKED_LUA = (
     + """
 -- 前置核对：当前定义必须与快照逐项一致（数量、顺序、键名），
 -- 且每个前置的已提交结果版本（结果 Hash 的 fencing）必须与快照相同。
+-- 版本按精确十进制字符串比较：2^53 以上 tonumber 会把相邻序号舍入成同值，
+-- 会把真实的版本漂移误判为一致（或把一致误判为漂移），故绝不转 number。
 local result_prefix = ARGV[7]
 local n = tonumber(ARGV[8])
 local current = redis.call('LRANGE', KEYS[5], 0, -1)
@@ -586,7 +614,7 @@ if #current ~= n then
   audit_add(KEYS[3], retention,
     {'op', 'result_commit', 'result', 'stale_dependencies',
      'fencing', ARGV[2], 'time_ms', tostring(now)})
-  return {0, 'stale_dependencies', tonumber(current_fencing), 0}
+  return {0, 'stale_dependencies', current_fencing, 0}
 end
 for i = 1, n do
   local snap_dep = ARGV[8 + i]
@@ -594,17 +622,17 @@ for i = 1, n do
     audit_add(KEYS[3], retention,
       {'op', 'result_commit', 'result', 'stale_dependencies',
        'fencing', ARGV[2], 'time_ms', tostring(now)})
-    return {0, 'stale_dependencies', tonumber(current_fencing), 0}
+    return {0, 'stale_dependencies', current_fencing, 0}
   end
-  -- 快照中该前置的结果版本（ARGV[n+8+i]）；可提交快照中每项恒为真实版本，
-  -- "0" 仅作为防御性兜底
-  local snap_f = tonumber(ARGV[n + 8 + i])
-  local cur_f = tonumber(redis.call('HGET', result_prefix .. snap_dep, 'fencing'))
-  if (cur_f or 0) ~= snap_f then
+  -- 快照中该前置的结果版本（ARGV[n+8+i]）；可提交快照中每项恒为真实版本。
+  -- 缺失结果（HGET 为 false）时取空串：与任何真实版本都不相等，判 stale。
+  local snap_f = ARGV[n + 8 + i]
+  local cur_f = redis.call('HGET', result_prefix .. snap_dep, 'fencing')
+  if (cur_f or '') ~= snap_f then
     audit_add(KEYS[3], retention,
       {'op', 'result_commit', 'result', 'stale_dependencies',
        'fencing', ARGV[2], 'time_ms', tostring(now)})
-    return {0, 'stale_dependencies', tonumber(current_fencing), 0}
+    return {0, 'stale_dependencies', current_fencing, 0}
   end
 end
 """
@@ -804,8 +832,10 @@ end
 
 local reply = {1, #deps}
 for _, dep in ipairs(deps) do
+  -- 结果版本按精确十进制字符串返回（2^53 以上不经过 tonumber），
+  -- 调用方原样带回 commit-checked 做字符串级版本核对
   reply[#reply + 1] = dep
-  reply[#reply + 1] = tonumber(redis.call('HGET', ARGV[2] .. dep, 'fencing'))
+  reply[#reply + 1] = redis.call('HGET', ARGV[2] .. dep, 'fencing')
 end
 return reply
 """

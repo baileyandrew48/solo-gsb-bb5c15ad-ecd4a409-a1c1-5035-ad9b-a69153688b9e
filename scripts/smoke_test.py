@@ -55,6 +55,11 @@ commit-checked 与普通提交相同的凭据 / 防栅 / 幂等语义、
 前置版本漂移或定义变更 / 乱序 -> 409 stale_dependencies 且不改结果、
 重新拉快照后成功、空快照（含缺省字段）等价普通提交、
 快照参数校验 422、并发同内容恰好一次提交、stale_dependencies 落审计；
+以及 2^53 以上的防栅序号精度（直连预置计数器 = 2^53）：
+单项 / 批量申请与交接返回并保存精确递增的十进制序号、
+相邻序号旧凭据不得通过校验、普通提交按完整整数版本判定
+（新版本同内容覆盖而非误判重放 / 同版本不同内容仍冲突）、
+相邻大版本快照漂移返回 stale_dependencies、HTTP 字段仍是精确 JSON 数字；
 以及按资源键分配并发容量：
 未配置即申请 409 not_configured / 设置容量 / 加权申请剩余递减 /
 容量不足 429 不占用且带 Retry-After / 权重超容量 409 /
@@ -249,6 +254,7 @@ def main():
     limit_checks()
     dependency_checks()
     checked_commit_checks()
+    big_fencing_checks()
     non_finite_result_checks()
     capacity_checks()
     capacity_summary_checks()
@@ -885,6 +891,229 @@ def result_checks():
           and sum(1 for e in crc if e["result"] == "replayed") == 19
           and all(e["fencing_token"] == ca["fencing_token"] for e in crc),
           f"{[(e['result'], e['fencing_token']) for e in crc]}")
+
+
+def big_fencing_checks():
+    """防栅序号越过 2^53 后的精度回归（Redis Lua 的 number 是 double）。
+
+    直连 Redis 把计数器预置为 2^53（9007199254740992）：
+    - 单项 / 批量申请与交接必须返回并保存**精确递增**的十进制序号
+      （旧实现把 INCR 的 Lua 数值回复直接落 Hash / 返回，>=2^53 后相邻序号
+      被舍入成同一个 double，交接后新序号看起来没递增）；
+    - 旧凭据（token 或相邻防栅序号）不得因舍入通过校验；
+    - 普通结果提交按完整整数版本判定：新版本相同内容必须覆盖写入
+      （committed），旧实现会因 tonumber 把相邻版本判成同版而返回 replay；
+    - 带前置快照的提交：相邻大版本漂移必须 stale_dependencies；
+    - 全程 HTTP 字段仍是 JSON 数字且值精确（Python int 任意精度可直接比对）。
+    """
+    base = f"smoke-bigfence:{int(time.time() * 1000)}"
+    prefix = os.environ.get("SMOKE_KEY_PREFIX", "lease")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+    F0 = 1 << 53              # 9007199254740992（首个不能保证 double 精确步进的起点）
+    F1 = F0 + 1               # 9007199254740993
+    F2 = F0 + 2               # 9007199254740994
+    assert len({F0, F1, F2}) == 3
+
+    def counter(k):
+        return f"{prefix}:fencing:{k}"
+
+    def lease_hash(k):
+        return f"{prefix}:lease:{k}"
+
+    def commit(k, token, fence, result):
+        return call("POST", "/v1/results/commit",
+                    {"task_key": k, "token": token,
+                     "fencing_token": fence, "result": result})
+
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("bigfence redis reachable", False, f"{host}:{port} {exc}")
+        return
+    try:
+        # ---- 单项申请：预置计数器 = 2^53，申请必须得到精确的 2^53+1 ----
+        k = f"{base}:single"
+        r.execute("SET", counter(k), F0)
+        code, a = call("POST", "/v1/leases/acquire",
+                       {"task_key": k, "ttl_ms": 60_000})
+        check("bigfence acquire exact 2^53+1",
+              code == 200 and a["acquired"]
+              and isinstance(a["fencing_token"], int)
+              and a["fencing_token"] == F1, f"{code} {a}")
+        check("bigfence acquire hash stores exact decimal",
+              r.execute("HGET", lease_hash(k), "fencing") == str(F1),
+              r.execute("HGET", lease_hash(k), "fencing"))
+        token1 = a["token"]
+
+        # 占用冲突返回的当前序号同样精确
+        code, b = call("POST", "/v1/leases/acquire",
+                       {"task_key": k, "ttl_ms": 60_000})
+        check("bigfence conflict returns exact fencing",
+              code == 409 and b["fencing_token"] == F1, f"{code} {b}")
+
+        # 相邻序号不得通过校验；精确凭据通过
+        code, v = call("POST", "/v1/leases/validate",
+                       {"task_key": k, "token": token1, "fencing_token": F0})
+        check("bigfence validate adjacent fencing rejected",
+              code == 200 and not v["valid"], f"{code} {v}")
+        code, v = call("POST", "/v1/leases/validate",
+                       {"task_key": k, "token": token1, "fencing_token": F1})
+        check("bigfence validate exact fencing accepted",
+              code == 200 and v["valid"], f"{code} {v}")
+
+        # ---- 交接：精确 +1；旧凭据立即失效；连续交接继续精确递增 ----
+        code, t = call("POST", "/v1/leases/transfer",
+                       {"task_key": k, "token": token1, "fencing_token": F1})
+        check("bigfence transfer exact 2^53+2",
+              code == 200 and t["transferred"] and t["fencing_token"] == F2
+              and isinstance(t["fencing_token"], int), f"{code} {t}")
+        check("bigfence transfer counter/hash exact",
+              r.execute("GET", counter(k)) == str(F2)
+              and r.execute("HGET", lease_hash(k), "fencing") == str(F2),
+              f"{r.execute('GET', counter(k))} / "
+              f"{r.execute('HGET', lease_hash(k), 'fencing')}")
+        token2 = t["token"]
+        # 旧凭据交接 / 校验都失败，且失败回带的当前序号精确为 F2
+        code, old_t = call("POST", "/v1/leases/transfer",
+                           {"task_key": k, "token": token1, "fencing_token": F1})
+        check("bigfence old credential transfer rejected",
+              code == 409 and old_t["reason"] == "conflict"
+              and old_t["fencing_token"] == F2, f"{code} {old_t}")
+        code, v = call("POST", "/v1/leases/validate",
+                       {"task_key": k, "token": token1, "fencing_token": F1})
+        check("bigfence old credential validate rejected",
+              code == 200 and not v["valid"], f"{code} {v}")
+        # 新 token 配相邻错误序号 F1 / F3 同样不得通过
+        for wrong_f in (F1, F2 + 1):
+            code, v = call("POST", "/v1/leases/validate",
+                           {"task_key": k, "token": token2,
+                            "fencing_token": wrong_f})
+            check("bigfence new token wrong fencing rejected",
+                  code == 200 and not v["valid"], f"{wrong_f} {v}")
+
+        # ---- 普通结果提交：完整整数版本判定 ----
+        code, c = commit(k, token2, F2, {"v": 1})
+        check("bigfence commit at 2^53+2",
+              code == 200 and c["committed"] and not c["replayed"]
+              and c["fencing_token"] == F2, f"{code} {c}")
+        # 同版本同内容 -> 重放
+        code, c = commit(k, token2, F2, {"v": 1})
+        check("bigfence same version same content replay",
+              code == 200 and c["replayed"] and c["fencing_token"] == F2,
+              f"{code} {c}")
+        # 同版本不同内容 -> 冲突
+        code, c = commit(k, token2, F2, {"v": 2})
+        check("bigfence same version diff content conflict",
+              code == 409 and c["reason"] == "result_conflict", f"{code} {c}")
+        # 不属于当前租约的相邻序号 F3 -> conflict（不能借舍入冒充当前版本）
+        code, c = commit(k, token2, F2 + 1, {"v": 1})
+        check("bigfence adjacent fencing commit rejected",
+              code == 409 and c["reason"] == "conflict", f"{code} {c}")
+
+        # 再次交接得到 F3（=2^53+3），新版本提交**相同内容**必须覆盖写入，
+        # 旧实现 tonumber(F2)==tonumber(F3) 会把它误判为同版重放
+        code, t3 = call("POST", "/v1/leases/transfer",
+                        {"task_key": k, "token": token2, "fencing_token": F2})
+        check("bigfence second transfer exact 2^53+3",
+              code == 200 and t3["fencing_token"] == F2 + 1, f"{code} {t3}")
+        token3, F3 = t3["token"], t3["fencing_token"]
+        code, c = commit(k, token3, F3, {"v": 1})
+        check("bigfence new version same content overwrites (not replay)",
+              code == 200 and c["committed"] and not c["replayed"]
+              and c["fencing_token"] == F3, f"{code} {c}")
+        code, g = call("GET", f"/v1/results/{k}")
+        check("bigfence stored result version exact",
+              code == 200 and g["fencing_token"] == F3, f"{code} {g}")
+        # 旧持有者（token2/F2）此后任何提交都失败
+        code, c = commit(k, token2, F2, {"v": 9})
+        check("bigfence stale holder cannot commit",
+              code == 409 and c["reason"] == "conflict", f"{code} {c}")
+        # 审计事件携带的防栅序号全部精确
+        code, page = fetch_events(k)
+        fences = [e["fencing_token"] for e in page["events"]]
+        check("bigfence audit fencing exact",
+              all(f is None or f in (F1, F2, F3) for f in fences)
+              and F2 in fences and F3 in fences, f"{fences}")
+
+        # ---- 批量申请：预置计数器 = 2^53，两项都必须精确得到 2^53+1 ----
+        bk1, bk2 = f"{base}:batch:1", f"{base}:batch:2"
+        r.execute("SET", counter(bk1), F0)
+        r.execute("SET", counter(bk2), F0)
+        code, batch = call("POST", "/v1/leases/acquire-batch",
+                           {"task_keys": [bk1, bk2], "ttl_ms": 60_000})
+        check("bigfence batch acquire exact",
+              code == 200 and batch["acquired"]
+              and [l["fencing_token"] for l in batch["leases"]] == [F1, F1]
+              and all(isinstance(l["fencing_token"], int)
+                      for l in batch["leases"]), f"{code} {batch}")
+        check("bigfence batch counters exact",
+              r.execute("GET", counter(bk1)) == str(F1)
+              and r.execute("GET", counter(bk2)) == str(F1),
+              f"{r.execute('GET', counter(bk1))} "
+              f"{r.execute('GET', counter(bk2))}")
+        for l in batch["leases"]:
+            code, v = call("POST", "/v1/leases/validate",
+                           {"task_key": l["task_key"], "token": l["token"],
+                            "fencing_token": l["fencing_token"]})
+            check("bigfence batch credential validates",
+                  code == 200 and v["valid"], f"{code} {v}")
+
+        # ---- 前置快照：相邻大版本漂移必须被检出 ----
+        pk, tk = f"{base}:pre", f"{base}:target"
+        r.execute("SET", counter(pk), F0)
+        code, pa = call("POST", "/v1/leases/acquire",
+                        {"task_key": pk, "ttl_ms": 60_000})
+        check("bigfence prereq acquire exact",
+              code == 200 and pa["fencing_token"] == F1, f"{code} {pa}")
+        code, pc = commit(pk, pa["token"], F1, {"v": 1})
+        check("bigfence prereq commit", code == 200 and pc["committed"], f"{code} {pc}")
+        code, _ = call("POST", f"/v1/dependencies/{tk}",
+                       {"dependencies": [pk]})
+        check("bigfence deps saved", code == 200, f"code={code}")
+        code, snap = call("GET", f"/v1/dependencies/{tk}/snapshot")
+        check("bigfence snapshot exact version",
+              code == 200 and snap["status"] == "snapshot"
+              and snap["dependencies"] == [{"task_key": pk, "fencing_token": F1}]
+              and isinstance(snap["dependencies"][0]["fencing_token"], int),
+              f"{code} {snap}")
+        # 前置交接后提交新版本 F2（与快照 F1 相邻，double 下舍入相等）
+        code, pt = call("POST", "/v1/leases/transfer",
+                        {"task_key": pk, "token": pa["token"],
+                         "fencing_token": F1})
+        check("bigfence prereq transfer exact",
+              code == 200 and pt["fencing_token"] == F2, f"{code} {pt}")
+        code, pc2 = commit(pk, pt["token"], F2, {"v": 2})
+        check("bigfence prereq new version commit",
+              code == 200 and pc2["fencing_token"] == F2, f"{code} {pc2}")
+        # 目标租约用旧快照提交 -> stale_dependencies（旧实现 tonumber 误放行）
+        code, ta = call("POST", "/v1/leases/acquire",
+                        {"task_key": tk, "ttl_ms": 60_000})
+        check("bigfence target acquire", code == 200 and ta["acquired"], f"{code} {ta}")
+        code, cc = call("POST", "/v1/results/commit-checked",
+                        {"task_key": tk, "token": ta["token"],
+                         "fencing_token": ta["fencing_token"],
+                         "result": {"ok": True},
+                         "snapshot": [{"task_key": pk, "fencing_token": F1}]})
+        check("bigfence adjacent snapshot drift -> stale_dependencies",
+              code == 409 and cc["reason"] == "stale_dependencies"
+              and not cc["committed"], f"{code} {cc}")
+        # 重新拉取的快照为 F2，提交成功
+        code, snap2 = call("GET", f"/v1/dependencies/{tk}/snapshot")
+        check("bigfence refreshed snapshot version",
+              code == 200
+              and snap2["dependencies"] == [{"task_key": pk, "fencing_token": F2}],
+              f"{code} {snap2}")
+        code, cc = call("POST", "/v1/results/commit-checked",
+                        {"task_key": tk, "token": ta["token"],
+                         "fencing_token": ta["fencing_token"],
+                         "result": {"ok": True},
+                         "snapshot": [{"task_key": pk, "fencing_token": F2}]})
+        check("bigfence checked commit with fresh snapshot",
+              code == 200 and cc["committed"] and not cc["replayed"],
+              f"{code} {cc}")
+    finally:
+        r.close()
 
 
 def fetch_changes(cursor=None, limit=None):
